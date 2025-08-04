@@ -1,25 +1,34 @@
 //! ARM Generic Interrupt Controller (GIC).
 
-use arm_gicv2::{GicCpuInterface, GicDistributor, InterruptType, translate_irq};
-use axplat::irq::{HandlerTable, IrqHandler};
+use arm_gic_driver::v2::*;
+use axplat::irq::{HandlerTable, IpiTarget, IrqHandler};
 use axplat::mem::VirtAddr;
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
+use spin::{Mutex, Once};
 
 /// The maximum number of IRQs.
 const MAX_IRQ_COUNT: usize = 1024;
 
-static GICD: LazyInit<SpinNoIrq<GicDistributor>> = LazyInit::new();
+static GIC: Mutex<Gic> = Mutex::new(unsafe {
+    Gic::new(
+        arm_gic_driver::VirtAddr::new(0),
+        arm_gic_driver::VirtAddr::new(0),
+        None,
+    )
+});
 
-// per-CPU, no lock
-static GICC: LazyInit<GicCpuInterface> = LazyInit::new();
+static TRAP_OP: Once<TrapOp> = Once::new();
+
+static CPU_IF: Mutex<Option<CpuInterface>> = Mutex::new(None);
 
 static IRQ_HANDLER_TABLE: HandlerTable<MAX_IRQ_COUNT> = HandlerTable::new();
 
 /// Enables or disables the given IRQ.
 pub fn set_enable(irq_num: usize, enabled: bool) {
-    trace!("GICD set enable: {} {}", irq_num, enabled);
-    GICD.lock().set_enable(irq_num as _, enabled);
+    trace!("GIC set enable: {} {}", irq_num, enabled);
+    let intid = unsafe { IntId::raw(irq_num as u32) };
+    GIC.lock().set_irq_enable(intid, enabled);
 }
 
 /// Registers an IRQ handler for the given IRQ.
@@ -52,42 +61,81 @@ pub fn unregister_handler(irq_num: usize) -> Option<IrqHandler> {
 /// IRQ handler table and calls the corresponding handler. If necessary, it
 /// also acknowledges the interrupt controller after handling.
 pub fn handle_irq(_unused: usize) {
-    GICC.handle_irq(|irq_num| {
-        trace!("IRQ {}", irq_num);
-        if !IRQ_HANDLER_TABLE.handle(irq_num as _) {
-            warn!("Unhandled IRQ {}", irq_num);
+    let ack = TRAP_OP.wait().ack();
+    debug!("Handling IRQ: {ack:?}");
+
+    let irq_num = match ack {
+        Ack::Other(intid) if intid == arm_gic_driver::IntId::ppi(14) => intid,
+        Ack::SGI { intid, cpu_id } => intid,
+        _ => {
+            warn!("Unhandled IRQ: {ack:?}");
+            return;
         }
-    });
+    };
+    if !IRQ_HANDLER_TABLE.handle(irq_num.to_u32() as _) {
+        warn!("Unhandled IRQ {:?}", irq_num);
+    }
+    if !ack.is_special() {
+        TRAP_OP.wait().eoi(ack);
+        if TRAP_OP.wait().eoi_mode_ns() {
+            TRAP_OP.wait().dir(ack);
+        }
+    }
 }
 
-/// Returns the IRQ number of the IPI.
-pub fn get_ipi_irq_num() -> usize {
-    translate_irq(1, InterruptType::SGI).unwrap()
-}
-
-/// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU.
-pub fn send_ipi_one(dest_cpu_id: usize, irq_num: usize) {
-    GICD.lock().send_sgi(dest_cpu_id, irq_num);
-}
-
-/// Sends a broadcast IPI to all CPUs.
-pub fn send_ipi_all_others(irq_num: usize, _src_cpu_id: usize, _cpu_num: usize) {
-    GICD.lock().send_sgi_all_except_self(irq_num);
-}
-
-/// Initializes GICD (for the primary CPU only).
-pub fn init_gicd(gicd_base: VirtAddr, gicc_base: VirtAddr) {
+/// Initializes GIC
+pub fn init_gic(gicd_base: VirtAddr, gicc_base: VirtAddr) {
     info!("Initialize GICv2...");
-    GICD.init_once(SpinNoIrq::new(GicDistributor::new(gicd_base.as_mut_ptr())));
-    GICC.init_once(GicCpuInterface::new(gicc_base.as_mut_ptr()));
-    GICD.lock().init();
+    let gicd_base = arm_gic_driver::VirtAddr::new(gicd_base.into());
+    let gicc_base = arm_gic_driver::VirtAddr::new(gicc_base.into());
+    let mut gic = unsafe { Gic::new(gicd_base, gicc_base, None) };
+
+    gic.init();
+
+    *GIC.lock() = gic;
 }
 
 /// Initializes GICC (for all CPUs).
 ///
-/// It must be called after [`init_gicd`].
+/// It must be called after [`init_gic`].
 pub fn init_gicc() {
-    GICC.init();
+    debug!("Initialize GIC CPU Interface...");
+    let mut cpu = GIC.lock().cpu_interface();
+    cpu.init_current_cpu();
+    cpu.set_eoi_mode_ns(false);
+    {
+        TRAP_OP.call_once(|| cpu.trap_operations());
+        let mut g = CPU_IF.lock();
+        if g.is_none() {
+            g.replace(cpu);
+        }
+    }
+}
+
+/// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU or all CPUs.
+pub fn send_ipi(
+    irq_num: usize,
+    src_cpu_id: Option<usize>,
+    dest_cpu_id: Option<usize>,
+    cpu_num: Option<usize>,
+    target: IpiTarget,
+) {
+    match target {
+        IpiTarget::Specific => {
+            let target_list = TargetList::new(&mut [dest_cpu_id.unwrap()].into_iter());
+            GIC.lock().send_sgi(
+                IntId::sgi(irq_num as u32),
+                SGITarget::TargetList(target_list),
+            );
+        }
+        IpiTarget::AllOthers => {
+            GIC.lock()
+                .send_sgi(IntId::sgi(irq_num as u32), SGITarget::AllOther);
+        }
+        _ => {
+            warn!("Unsupported IPI target.");
+        }
+    }
 }
 
 /// Default implementation of [`axplat::irq::IrqIf`] using the GIC.
@@ -128,19 +176,15 @@ macro_rules! irq_if_impl {
                 $crate::gic::handle_irq(irq)
             }
 
-            /// Returns the IRQ number of the IPI.
-            fn get_ipi_irq_num() -> usize {
-                $crate::gic::get_ipi_irq_num()
-            }
-
-            /// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU.
-            fn send_ipi_one(dest_cpu_id: usize, irq_num: usize) {
-                $crate::gic::send_ipi_one(dest_cpu_id, irq_num);
-            }
-
-            /// Sends a broadcast IPI to all CPUs.
-            fn send_ipi_all_others(irq_num: usize, _src_cpu_id: usize, _cpu_num: usize) {
-                $crate::gic::send_ipi_all_others(irq_num, _src_cpu_id, _cpu_num);
+            /// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU or all CPUs.
+            fn send_ipi(
+                irq_num: usize,
+                src_cpu_id: Option<usize>,
+                dest_cpu_id: Option<usize>,
+                cpu_num: Option<usize>,
+                target: axplat::irq::IpiTarget,
+            ) {
+                $crate::gic::send_ipi(irq_num, src_cpu_id, dest_cpu_id, cpu_num, target);
             }
         }
     };

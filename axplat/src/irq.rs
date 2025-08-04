@@ -5,6 +5,13 @@ pub use handler_table::HandlerTable;
 /// The type if an IRQ handler.
 pub type IrqHandler = handler_table::Handler;
 
+pub enum IpiTarget {
+    /// Send to a specific CPU.
+    Specific,
+    /// Send to all other CPUs.
+    AllOthers,
+}
+
 /// IRQ management interface.
 #[def_plat_interface]
 pub trait IrqIf {
@@ -30,12 +37,12 @@ pub trait IrqIf {
     /// also acknowledges the interrupt controller after handling.
     fn handle(irq: usize);
 
-    /// Returns the IRQ number of the IPI.
-    fn get_ipi_irq_num() -> usize;
-
-    /// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU.
-    fn send_ipi_one(dest_cpu_id: usize, irq_num: usize);
-
-    /// Sends a broadcast IPI to all CPUs.
-    fn send_ipi_all_others(irq_num: usize, src_cpu_id: usize, cpu_num: usize);
+    /// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU or all CPUs.
+    fn send_ipi(
+        irq_num: usize,
+        src_cpu_id: Option<usize>,
+        dest_cpu_id: Option<usize>,
+        cpu_num: Option<usize>,
+        target: IpiTarget,
+    );
 }

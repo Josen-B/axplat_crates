@@ -105,7 +105,7 @@ pub fn init_secondary() {
 
 #[cfg(feature = "irq")]
 mod irq_impl {
-    use axplat::irq::{HandlerTable, IrqHandler, IrqIf};
+    use axplat::irq::{HandlerTable, IpiTarget, IrqHandler, IrqIf};
 
     /// The maximum number of IRQs.
     const MAX_IRQ_COUNT: usize = 256;
@@ -156,24 +156,31 @@ mod irq_impl {
             unsafe { super::local_apic().end_of_interrupt() };
         }
 
-        /// Returns the IRQ number of the IPI.
-        fn get_ipi_irq_num() -> usize {
-            super::APIC_IPI_VECTOR as usize
-        }
-
-        /// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU.
-        fn send_ipi_one(dest_cpu_id: usize, irq_num: usize) {
-            unsafe {
-                super::local_apic().send_ipi(irq_num as _, dest_cpu_id as _);
-            };
-        }
-
-        /// Sends a broadcast IPI to all CPUs.
-        fn send_ipi_all_others(irq_num: usize, _src_cpu_id: usize, _cpu_num: usize) {
-            use x2apic::lapic::IpiAllShorthand;
-            unsafe {
-                super::local_apic().send_ipi_all(irq_num as _, IpiAllShorthand::AllExcludingSelf);
-            };
+        /// Sends Software Generated Interrupt (SGI)(s) (usually IPI) to the given dest CPU or all CPUs.
+        fn send_ipi(
+            irq_num: usize,
+            src_cpu_id: Option<usize>,
+            dest_cpu_id: Option<usize>,
+            cpu_num: Option<usize>,
+            target: IpiTarget,
+        ) {
+            match target {
+                IpiTarget::Specific => {
+                    unsafe {
+                        super::local_apic().send_ipi(irq_num as _, dest_cpu_id.unwrap() as _);
+                    };
+                }
+                IpiTarget::AllOthers => {
+                    use x2apic::lapic::IpiAllShorthand;
+                    unsafe {
+                        super::local_apic()
+                            .send_ipi_all(irq_num as _, IpiAllShorthand::AllExcludingSelf);
+                    };
+                }
+                _ => {
+                    warn!("Unsupported IPI target.");
+                }
+            }
         }
     }
 }
