@@ -22,6 +22,7 @@ pub mod config {
         "`PACKAGE` field in the configuration does not match the Package name. Please check your configuration file."
     );
 }
+// test
 
 axplat_aarch64_peripherals::console_if_impl!(ConsoleIfImpl);
 axplat_aarch64_peripherals::time_if_impl!(TimeIfImpl);
